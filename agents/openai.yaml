@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex History Recovery"
+  short_description: "Diagnose and repair hidden Codex local chat history."
+  default_prompt: "Use $codex-history-recovery to diagnose and repair hidden Codex chat history after switching provider or login."
