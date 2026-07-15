@@ -22,6 +22,7 @@ from typing import Any
 
 
 EXTENDED_PREFIX = "\\\\?\\"
+SESSION_DIRS = ("sessions", "archived_sessions")
 
 
 def default_codex_home() -> pathlib.Path:
@@ -254,6 +255,213 @@ def make_backup(codex_home: pathlib.Path) -> pathlib.Path:
     return backup
 
 
+def backup_tree_stats(path: pathlib.Path) -> dict[str, Any]:
+    bytes_seen = 0
+    files_seen = 0
+    jsonl_seen = 0
+    sqlite_seen = 0
+    latest = path.stat().st_mtime
+    for item in path.rglob("*"):
+        if not item.is_file():
+            continue
+        try:
+            stat = item.stat()
+        except OSError:
+            continue
+        bytes_seen += stat.st_size
+        files_seen += 1
+        if item.suffix == ".jsonl":
+            jsonl_seen += 1
+        if item.suffix == ".sqlite":
+            sqlite_seen += 1
+        latest = max(latest, stat.st_mtime)
+    return {
+        "bytes": bytes_seen,
+        "files": files_seen,
+        "jsonl": jsonl_seen,
+        "sqlite": sqlite_seen,
+        "latest_mtime": latest,
+        "latest_time": dt.datetime.fromtimestamp(latest).isoformat(),
+    }
+
+
+def sorted_sample(values: set[str], limit: int = 5) -> list[str]:
+    return sorted(values)[:limit]
+
+
+def jsonl_identity_keys(root: pathlib.Path) -> set[str]:
+    keys: set[str] = set()
+    for dirname in SESSION_DIRS:
+        base = root / dirname
+        if not base.exists():
+            continue
+        for path in base.rglob("*.jsonl"):
+            rel = path.relative_to(root).as_posix()
+            key = f"path:{rel}"
+            try:
+                first = first_json_line(path)
+                payload = first.get("payload") if isinstance(first, dict) else None
+                thread_id = payload.get("id") if isinstance(payload, dict) else None
+                if isinstance(thread_id, str) and thread_id:
+                    key = f"id:{thread_id}"
+            except Exception:
+                pass
+            keys.add(key)
+    return keys
+
+
+def sqlite_backup_health(path: pathlib.Path) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.is_file(),
+        "size": path.stat().st_size if path.exists() else 0,
+        "ok": False,
+    }
+    if not path.is_file() or info["size"] == 0:
+        info["error"] = "missing or empty"
+        return info
+    try:
+        con = connect_ro(path)
+        try:
+            tables = [r["name"] for r in con.execute("select name from sqlite_master where type='table'")]
+            info["has_threads"] = "threads" in tables
+            if "threads" in tables:
+                info["threads"] = con.execute("select count(*) from threads").fetchone()[0]
+            info["ok"] = True
+        finally:
+            con.close()
+    except Exception as exc:
+        info["error"] = repr(exc)
+    return info
+
+
+def backup_source_coverage(backup: pathlib.Path, codex_home: pathlib.Path) -> dict[str, Any]:
+    source_keys = jsonl_identity_keys(codex_home)
+    backup_keys = jsonl_identity_keys(backup)
+    missing_keys = source_keys - backup_keys
+    db_health = []
+    db_ok = True
+    for db in candidate_state_dbs(codex_home):
+        dst = backup / db.relative_to(codex_home)
+        health = sqlite_backup_health(dst)
+        db_health.append(health)
+        db_ok = db_ok and bool(health.get("ok"))
+    return {
+        "complete": db_ok and not missing_keys,
+        "source_jsonl_keys": len(source_keys),
+        "backup_jsonl_keys": len(backup_keys),
+        "missing_jsonl_keys": len(missing_keys),
+        "missing_jsonl_sample": sorted_sample(missing_keys),
+        "db_health": db_health,
+    }
+
+
+def backup_completeness(backup: pathlib.Path, codex_home: pathlib.Path) -> dict[str, Any]:
+    missing: list[str] = []
+    for name in ("manifest.json", "apply-report.json"):
+        if not (backup / name).is_file():
+            missing.append(name)
+
+    for dirname in SESSION_DIRS:
+        src = codex_home / dirname
+        if src.exists() and not (backup / dirname).is_dir():
+            missing.append(f"{dirname}/")
+
+    dbs = candidate_state_dbs(codex_home)
+    if not dbs:
+        missing.append("state_5.sqlite source")
+    db_health = []
+    for db in dbs:
+        dst = backup / db.relative_to(codex_home)
+        health = sqlite_backup_health(dst)
+        db_health.append(health)
+        if not health.get("ok"):
+            missing.append(str(dst.relative_to(backup)))
+
+    stats = backup_tree_stats(backup)
+    if stats["sqlite"] == 0:
+        missing.append("*.sqlite")
+    if stats["jsonl"] == 0:
+        missing.append("*.jsonl")
+
+    return {
+        **stats,
+        "path": str(backup),
+        "complete": not missing,
+        "missing": missing,
+        "db_health": db_health,
+    }
+
+
+def prune_history_backups(codex_home: pathlib.Path, keep_backups: int) -> dict[str, Any]:
+    if keep_backups < 1:
+        raise ValueError("--keep-backups must be at least 1")
+
+    backup_root = codex_home / "backups_state" / "codex-history-recovery"
+    if not backup_root.exists():
+        return {"backup_root": str(backup_root), "kept": [], "deleted": [], "skipped": "backup root missing"}
+
+    root_resolved = backup_root.resolve()
+    backups = [
+        path
+        for path in backup_root.iterdir()
+        if path.is_dir() and not path.is_symlink()
+    ]
+    inspected = [backup_completeness(path, codex_home) for path in backups]
+    complete = [info for info in inspected if info["complete"]]
+    if not complete:
+        return {
+            "backup_root": str(backup_root),
+            "kept": [],
+            "deleted": [],
+            "inspected": inspected,
+            "skipped": "no complete backups found; refused to delete anything",
+        }
+
+    complete.sort(
+        key=lambda info: (info["latest_mtime"], info["bytes"], info["files"]),
+        reverse=True,
+    )
+    kept_infos = complete[:keep_backups]
+    kept_resolved = [pathlib.Path(info["path"]).resolve() for info in kept_infos]
+    kept_paths = set(kept_resolved)
+    kept_jsonl_keys: set[str] = set()
+    for info in kept_infos:
+        kept_jsonl_keys.update(jsonl_identity_keys(pathlib.Path(info["path"])))
+    deleted: list[str] = []
+    skipped: list[dict[str, Any]] = []
+
+    for info in inspected:
+        path = pathlib.Path(info["path"])
+        resolved = path.resolve()
+        if resolved in kept_paths:
+            continue
+        if resolved.parent != root_resolved:
+            raise RuntimeError(f"Refusing to delete non-child backup path: {resolved}")
+        missing_from_kept = jsonl_identity_keys(path) - kept_jsonl_keys
+        if missing_from_kept:
+            skipped.append(
+                {
+                    "path": str(resolved),
+                    "reason": "retained backups do not cover all JSONL session ids/paths",
+                    "missing_jsonl_keys": len(missing_from_kept),
+                    "missing_jsonl_sample": sorted_sample(missing_from_kept),
+                }
+            )
+            continue
+        shutil.rmtree(resolved)
+        deleted.append(str(resolved))
+
+    return {
+        "backup_root": str(backup_root),
+        "keep_backups": keep_backups,
+        "kept": [str(path) for path in kept_resolved],
+        "deleted": deleted,
+        "skipped": skipped,
+        "inspected": inspected,
+    }
+
+
 def apply_db(path: pathlib.Path, provider: str) -> dict[str, Any]:
     con = sqlite3.connect(str(path), timeout=30)
     con.row_factory = sqlite3.Row
@@ -420,6 +628,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
     final_status = [
         summarize_db(path, roots, args.thread_id) for path in candidate_state_dbs(codex_home)
     ]
+    new_backup_integrity = backup_source_coverage(backup, codex_home)
     report = {
         "backup_dir": str(backup),
         "target_provider": provider,
@@ -427,11 +636,23 @@ def cmd_apply(args: argparse.Namespace) -> int:
         "db_apply": db_reports,
         "jsonl_apply": jsonl_report,
         "final_state_dbs": final_status,
+        "new_backup_integrity": new_backup_integrity,
     }
     (backup / "apply-report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    if new_backup_integrity["complete"]:
+        report["backup_retention"] = prune_history_backups(codex_home, args.keep_backups)
+    else:
+        report["backup_retention"] = {
+            "skipped": "new backup did not pass basic source coverage; refused to prune old backups"
+        }
+    if backup.exists():
+        (backup / "apply-report.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     print_json(report)
     return 0
 
@@ -454,6 +675,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-running",
         action="store_true",
         help="Apply even if Codex Desktop/app-server processes appear to be running.",
+    )
+    apply.add_argument(
+        "--keep-backups",
+        type=int,
+        default=1,
+        help="Keep this many latest complete codex-history-recovery backups after a successful apply.",
     )
     apply.set_defaults(func=cmd_apply)
     return parser
