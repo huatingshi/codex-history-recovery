@@ -16,6 +16,7 @@ Use this skill when Codex local conversations disappear after switching provider
   - `threads.cwd` uses Windows extended paths like `\\?\D:\...` while saved project roots use `D:\...`.
 - Repair both active SQLite metadata and rollout JSONL `session_meta.payload` metadata. If only SQLite is edited, Codex may later read stale metadata back from rollout files.
 - Always create timestamped backups before writing.
+- Because chat backups can be several GB, keeping only the latest recovery backup is acceptable when the new backup passes lightweight coverage checks and covers JSONL session ids/paths from older backups.
 
 ## Preferred Workflow
 
@@ -42,11 +43,14 @@ python "$env:USERPROFILE\.codex\skills\codex-history-recovery\scripts\recover_co
 
 5. Ask the user to fully quit and reopen Codex Desktop. If UI still does not update, check whether a running app-server rewrote the active DB or whether a different DB path became active.
 
+6. When pruning old recovery backups, keep the default `--keep-backups 1` unless the user asks otherwise. The script should refuse to prune if the newest backup does not contain readable SQLite copies or does not cover current/older JSONL session ids or fallback paths.
+
 ## Safety Rules
 
 - Never delete sessions or databases for this recovery.
 - Never overwrite `auth.json`.
 - Never change message content, titles, timestamps, IDs, or rollout paths unless explicitly requested.
+- Never scan full message bodies or hash multi-GB session trees just to validate backup coverage. Prefer cheap checks: file listings, JSONL first-line `session_meta.payload.id`, fallback relative paths, and opening SQLite copies to count `threads`.
 - Prefer script `status` before `apply`.
 - If applying manually, repair both:
   - `~/.codex/sqlite/state_5.sqlite` when present.
