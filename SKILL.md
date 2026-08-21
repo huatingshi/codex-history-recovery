@@ -15,8 +15,18 @@ Use this skill when Codex local conversations disappear after switching provider
   - `threads.model_provider` does not match the current `model_provider` in `config.toml`.
   - `threads.cwd` uses Windows extended paths like `\\?\D:\...` while saved project roots use `D:\...`.
 - Repair both active SQLite metadata and rollout JSONL `session_meta.payload` metadata. If only SQLite is edited, Codex may later read stale metadata back from rollout files.
-- Always create timestamped backups before writing.
+- Run a change preflight first. Exit without creating a backup when nothing needs repair.
+- Always create or extend a validated recovery backup before writing.
 - Because chat backups can be several GB, keeping only the latest recovery backup is acceptable when the new backup passes lightweight coverage checks and covers JSONL session ids/paths from older backups.
+
+## Backup Location
+
+- On Windows, store recovery backups outside the active Codex home by default at `D:\CodexBackups\codex-history-recovery\<timestamp>`.
+- `CODEX_HISTORY_BACKUP_DIR` or the apply command's `--backup-root` can override the root explicitly.
+- Keep the existing retention policy: only the newest complete recovery backup is retained by default (`--keep-backups 1`).
+- A targeted `--thread-id` repair reuses the newest complete baseline and stores the exact pre-write DB/JSONL state under its `increments/` directory. This keeps one top-level backup while preserving rollback data.
+- The source records remain under `C:\Users\<user>\.codex`; only the recovery copy moves to D:.
+- After every successful recovery, report the backup path, total size in GB, total file count, JSONL count, SQLite count, and the retention result.
 
 ## Preferred Workflow
 
@@ -39,11 +49,21 @@ python "$env:USERPROFILE\.codex\skills\codex-history-recovery\scripts\recover_co
 python "$env:USERPROFILE\.codex\skills\codex-history-recovery\scripts\recover_codex_history.py" apply
 ```
 
+For one known thread, use the scoped fast path:
+
+```powershell
+python "$env:USERPROFILE\.codex\skills\codex-history-recovery\scripts\recover_codex_history.py" apply --thread-id <thread-id>
+```
+
+The scoped path updates only that thread in SQLite and its rollout JSONL. It appends a small pre-write snapshot to the latest complete baseline instead of copying the full session tree again. If no complete baseline exists, it creates one before writing.
+
 4. Prefer applying while Codex Desktop is fully quit. The script blocks by default when Codex processes are running; use `--allow-running` only when the user accepts that Desktop may rewrite the DB while open.
 
 5. Ask the user to fully quit and reopen Codex Desktop. If UI still does not update, check whether a running app-server rewrote the active DB or whether a different DB path became active.
 
 6. When pruning old recovery backups, keep the default `--keep-backups 1` unless the user asks otherwise. The script should refuse to prune if the newest backup does not contain readable SQLite copies or does not cover current/older JSONL session ids or fallback paths.
+
+7. Include the apply output's `backup_summary` and `backup_retention` in the completion message so the user can verify where the backup is stored and how much space it uses.
 
 ## Safety Rules
 
@@ -51,6 +71,8 @@ python "$env:USERPROFILE\.codex\skills\codex-history-recovery\scripts\recover_co
 - Never overwrite `auth.json`.
 - Never change message content, titles, timestamps, IDs, or rollout paths unless explicitly requested.
 - Never scan full message bodies or hash multi-GB session trees just to validate backup coverage. Prefer cheap checks: file listings, JSONL first-line `session_meta.payload.id`, fallback relative paths, and opening SQLite copies to count `threads`.
+- Mutate only the first `session_meta` record in a rollout. Preserve all subsequent message bytes exactly, and validate provider, cwd, and thread id after writing.
+- Refuse cleanup when backup validation or post-write validation fails.
 - Prefer script `status` before `apply`.
 - If applying manually, repair both:
   - `~/.codex/sqlite/state_5.sqlite` when present.
@@ -67,6 +89,7 @@ For the common Windows/API-login case, the repair should:
 - Set JSONL `session_meta.payload.model_provider` to the current provider.
 - Remove leading `\\?\` from JSONL `session_meta.payload.cwd`.
 - Leave messages and user content untouched.
+- Return `no_changes` without creating another backup when all selected metadata is already correct.
 
 ## Validation
 
@@ -76,6 +99,7 @@ After repair, verify:
 - Active DB CWD prefix count is `normal`.
 - Saved project roots have nonzero exact matches.
 - A known missing thread has the expected provider and project root.
+- `validation.ok` is true and `remaining_jsonl.files_to_change` is zero.
 
 Useful targeted query via the script:
 

@@ -23,6 +23,7 @@ from typing import Any
 
 EXTENDED_PREFIX = "\\\\?\\"
 SESSION_DIRS = ("sessions", "archived_sessions")
+DEFAULT_BACKUP_ROOT_WINDOWS = pathlib.Path("D:/CodexBackups/codex-history-recovery")
 
 
 def default_codex_home() -> pathlib.Path:
@@ -30,6 +31,15 @@ def default_codex_home() -> pathlib.Path:
     if env:
         return pathlib.Path(env).expanduser()
     return pathlib.Path.home() / ".codex"
+
+
+def default_backup_root(codex_home: pathlib.Path) -> pathlib.Path:
+    configured = os.environ.get("CODEX_HISTORY_BACKUP_DIR")
+    if configured:
+        return pathlib.Path(configured).expanduser()
+    if os.name == "nt":
+        return DEFAULT_BACKUP_ROOT_WINDOWS
+    return codex_home / "backups_state" / "codex-history-recovery"
 
 
 def load_current_provider(codex_home: pathlib.Path) -> str:
@@ -203,11 +213,136 @@ def running_codex_processes() -> list[dict[str, str]]:
 
 
 def first_json_line(path: pathlib.Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if line.strip():
-                return json.loads(line)
-    return {}
+    record = read_first_json_record(path)
+    return record["item"] if record else {}
+
+
+def read_first_json_record(path: pathlib.Path) -> dict[str, Any] | None:
+    """Read only the first non-empty JSON line and retain its byte location."""
+    with path.open("rb") as handle:
+        while True:
+            offset = handle.tell()
+            raw = handle.readline()
+            if not raw:
+                return None
+            if not raw.strip():
+                continue
+            body = raw.rstrip(b"\r\n")
+            newline = raw[len(body) :]
+            return {
+                "offset": offset,
+                "raw": raw,
+                "body": body,
+                "newline": newline,
+                "item": json.loads(body.decode("utf-8")),
+            }
+
+
+def session_meta_change(path: pathlib.Path, provider: str) -> dict[str, Any] | None:
+    record = read_first_json_record(path)
+    if not record:
+        return None
+    item = record["item"]
+    payload = item.get("payload") if isinstance(item, dict) else None
+    if item.get("type") != "session_meta" or not isinstance(payload, dict):
+        return None
+    before_provider = payload.get("model_provider")
+    before_cwd = payload.get("cwd")
+    after_cwd = (
+        before_cwd[len(EXTENDED_PREFIX) :]
+        if isinstance(before_cwd, str) and before_cwd.startswith(EXTENDED_PREFIX)
+        else before_cwd
+    )
+    if before_provider == provider and before_cwd == after_cwd:
+        return None
+    return {
+        "path": path,
+        "thread_id": payload.get("id"),
+        "before_provider": before_provider,
+        "before_cwd": before_cwd,
+        "after_provider": provider,
+        "after_cwd": after_cwd,
+    }
+
+
+def iter_jsonl_paths(codex_home: pathlib.Path):
+    for dirname in SESSION_DIRS:
+        root = codex_home / dirname
+        if root.exists():
+            yield from root.rglob("*.jsonl")
+
+
+def normalize_rollout_path(raw: str) -> pathlib.Path:
+    if raw.startswith(EXTENDED_PREFIX):
+        raw = raw[len(EXTENDED_PREFIX) :]
+    return pathlib.Path(raw)
+
+
+def find_thread_jsonl_paths(codex_home: pathlib.Path, thread_id: str) -> list[pathlib.Path]:
+    found: set[pathlib.Path] = set()
+    home_resolved = codex_home.resolve()
+    for db in candidate_state_dbs(codex_home):
+        con = connect_ro(db)
+        try:
+            row = con.execute("select rollout_path from threads where id=?", (thread_id,)).fetchone()
+            if row and isinstance(row["rollout_path"], str):
+                candidate = normalize_rollout_path(row["rollout_path"])
+                try:
+                    candidate.resolve().relative_to(home_resolved)
+                except ValueError:
+                    continue
+                if candidate.is_file():
+                    found.add(candidate)
+        finally:
+            con.close()
+    valid = []
+    for path in found:
+        try:
+            first = first_json_line(path)
+        except Exception:
+            # Preserve the DB-resolved target so preflight can report the parse error.
+            valid.append(path)
+            continue
+        payload = first.get("payload") if isinstance(first, dict) else None
+        if isinstance(payload, dict) and payload.get("id") == thread_id:
+            valid.append(path)
+    if valid:
+        return sorted(valid)
+    for path in iter_jsonl_paths(codex_home):
+        try:
+            first = first_json_line(path)
+        except Exception:
+            continue
+        payload = first.get("payload") if isinstance(first, dict) else None
+        if isinstance(payload, dict) and payload.get("id") == thread_id:
+            valid.append(path)
+    return sorted(set(valid))
+
+
+def collect_jsonl_changes(
+    codex_home: pathlib.Path, provider: str, thread_id: str | None
+) -> dict[str, Any]:
+    paths = (
+        find_thread_jsonl_paths(codex_home, thread_id)
+        if thread_id
+        else list(iter_jsonl_paths(codex_home))
+    )
+    changes = []
+    errors: list[dict[str, str]] = []
+    for path in paths:
+        try:
+            change = session_meta_change(path, provider)
+        except Exception as exc:
+            errors.append({"path": str(path), "error": repr(exc)})
+            continue
+        if change:
+            changes.append(change)
+    return {
+        "files_seen": len(paths),
+        "files_to_change": len(changes),
+        "changes": changes,
+        "errors": errors,
+    }
 
 
 def backup_sqlite(src: pathlib.Path, dst: pathlib.Path) -> None:
@@ -224,9 +359,10 @@ def backup_sqlite(src: pathlib.Path, dst: pathlib.Path) -> None:
             shutil.copy2(side, dst.parent / side.name)
 
 
-def make_backup(codex_home: pathlib.Path) -> pathlib.Path:
+def make_backup(codex_home: pathlib.Path, backup_root: pathlib.Path | None = None) -> pathlib.Path:
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup = codex_home / "backups_state" / "codex-history-recovery" / stamp
+    root = backup_root or default_backup_root(codex_home)
+    backup = root / stamp
     backup.mkdir(parents=True, exist_ok=False)
     for db in candidate_state_dbs(codex_home):
         rel = db.relative_to(codex_home)
@@ -253,6 +389,84 @@ def make_backup(codex_home: pathlib.Path) -> pathlib.Path:
         encoding="utf-8",
     )
     return backup
+
+
+def latest_complete_backup(
+    codex_home: pathlib.Path, backup_root: pathlib.Path
+) -> pathlib.Path | None:
+    if not backup_root.exists():
+        return None
+    candidates = sorted(
+        (path for path in backup_root.iterdir() if path.is_dir() and not path.is_symlink()),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    for path in candidates:
+        if backup_completeness(path, codex_home)["complete"]:
+            return path
+    return None
+
+
+def make_incremental_backup(
+    codex_home: pathlib.Path,
+    baseline: pathlib.Path,
+    thread_id: str,
+    jsonl_paths: list[pathlib.Path],
+) -> tuple[pathlib.Path, dict[str, Any]]:
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    increment = baseline / "increments" / f"{stamp}-{thread_id}"
+    increment.mkdir(parents=True, exist_ok=False)
+    copied: list[dict[str, Any]] = []
+    try:
+        for db in candidate_state_dbs(codex_home):
+            rel = db.relative_to(codex_home)
+            dst = increment / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            backup_sqlite(db, dst)
+            copied.append({"path": rel.as_posix(), "bytes": dst.stat().st_size, "kind": "sqlite"})
+        for src in jsonl_paths:
+            rel = src.relative_to(codex_home)
+            dst = increment / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            copied.append({"path": rel.as_posix(), "bytes": dst.stat().st_size, "kind": "jsonl"})
+        config = codex_home / "config.toml"
+        if config.exists():
+            shutil.copy2(config, increment / "config.toml")
+        db_health = [
+            sqlite_backup_health(increment / db.relative_to(codex_home))
+            for db in candidate_state_dbs(codex_home)
+        ]
+        jsonl_ok = all(
+            (increment / path.relative_to(codex_home)).stat().st_size == path.stat().st_size
+            for path in jsonl_paths
+        )
+        health = {
+            "complete": jsonl_ok and all(item.get("ok") for item in db_health),
+            "thread_id": thread_id,
+            "files": copied,
+            "db_health": db_health,
+        }
+        if not health["complete"]:
+            raise RuntimeError("Targeted backup did not pass pre-write validation")
+        (increment / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "scope": "thread",
+                    "thread_id": thread_id,
+                    "codex_home": str(codex_home),
+                    **health,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return increment, health
+    except Exception:
+        shutil.rmtree(increment, ignore_errors=True)
+        raise
 
 
 def backup_tree_stats(path: pathlib.Path) -> dict[str, Any]:
@@ -393,11 +607,15 @@ def backup_completeness(backup: pathlib.Path, codex_home: pathlib.Path) -> dict[
     }
 
 
-def prune_history_backups(codex_home: pathlib.Path, keep_backups: int) -> dict[str, Any]:
+def prune_history_backups(
+    codex_home: pathlib.Path,
+    keep_backups: int,
+    backup_root: pathlib.Path | None = None,
+) -> dict[str, Any]:
     if keep_backups < 1:
         raise ValueError("--keep-backups must be at least 1")
 
-    backup_root = codex_home / "backups_state" / "codex-history-recovery"
+    backup_root = backup_root or default_backup_root(codex_home)
     if not backup_root.exists():
         return {"backup_root": str(backup_root), "kept": [], "deleted": [], "skipped": "backup root missing"}
 
@@ -462,7 +680,36 @@ def prune_history_backups(codex_home: pathlib.Path, keep_backups: int) -> dict[s
     }
 
 
-def apply_db(path: pathlib.Path, provider: str) -> dict[str, Any]:
+def db_change_counts(path: pathlib.Path, provider: str, thread_id: str | None) -> dict[str, Any]:
+    con = connect_ro(path)
+    try:
+        scope = " and id=?" if thread_id else ""
+        params: tuple[Any, ...] = (provider, thread_id) if thread_id else (provider,)
+        provider_rows = con.execute(
+            "select count(*) from threads where (model_provider is null or model_provider<>?)" + scope,
+            params,
+        ).fetchone()[0]
+        cwd_params: tuple[Any, ...] = (thread_id,) if thread_id else ()
+        cwd_rows = con.execute(
+            "select count(*) from threads where cwd like '\\\\?\\%'" + scope,
+            cwd_params,
+        ).fetchone()[0]
+        exists = (
+            con.execute("select count(*) from threads where id=?", (thread_id,)).fetchone()[0]
+            if thread_id
+            else con.execute("select count(*) from threads").fetchone()[0]
+        )
+        return {
+            "path": str(path),
+            "thread_rows": exists,
+            "provider_rows": provider_rows,
+            "cwd_rows": cwd_rows,
+        }
+    finally:
+        con.close()
+
+
+def apply_db(path: pathlib.Path, provider: str, thread_id: str | None = None) -> dict[str, Any]:
     con = sqlite3.connect(str(path), timeout=30)
     con.row_factory = sqlite3.Row
     con.execute("pragma busy_timeout=30000")
@@ -481,16 +728,25 @@ def apply_db(path: pathlib.Path, provider: str) -> dict[str, Any]:
             "from threads group by kind"
         )
     }
+    scope = " and id=?" if thread_id else ""
+    provider_params: tuple[Any, ...] = (provider, thread_id) if thread_id else (provider,)
+    cwd_params: tuple[Any, ...] = (thread_id,) if thread_id else ()
     provider_rows = con.execute(
-        "select count(*) from threads where model_provider is null or model_provider<>?",
-        (provider,),
+        "select count(*) from threads where (model_provider is null or model_provider<>?)" + scope,
+        provider_params,
     ).fetchone()[0]
-    cwd_rows = con.execute("select count(*) from threads where cwd like '\\\\?\\%'").fetchone()[0]
+    cwd_rows = con.execute(
+        "select count(*) from threads where cwd like '\\\\?\\%'" + scope,
+        cwd_params,
+    ).fetchone()[0]
     con.execute(
-        "update threads set model_provider=? where model_provider is null or model_provider<>?",
-        (provider, provider),
+        "update threads set model_provider=? where (model_provider is null or model_provider<>?)" + scope,
+        (provider, provider, thread_id) if thread_id else (provider, provider),
     )
-    con.execute("update threads set cwd=substr(cwd,5) where cwd like '\\\\?\\%'")
+    con.execute(
+        "update threads set cwd=substr(cwd,5) where cwd like '\\\\?\\%'" + scope,
+        cwd_params,
+    )
     con.commit()
     after_provider = {
         r["provider"]: r["n"]
@@ -511,6 +767,7 @@ def apply_db(path: pathlib.Path, provider: str) -> dict[str, Any]:
     con.close()
     return {
         "path": str(path),
+        "thread_id": thread_id,
         "before_provider": before_provider,
         "before_cwd": before_cwd,
         "provider_rows_updated": provider_rows,
@@ -521,75 +778,124 @@ def apply_db(path: pathlib.Path, provider: str) -> dict[str, Any]:
     }
 
 
-def rewrite_jsonl_file(path: pathlib.Path, provider: str) -> tuple[bool, int]:
-    raw_lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-    out: list[str] = []
+def verify_session_meta(
+    path: pathlib.Path, provider: str, expected_thread_id: str | None = None
+) -> None:
+    first = first_json_line(path)
+    payload = first.get("payload") if isinstance(first, dict) else None
+    if first.get("type") != "session_meta" or not isinstance(payload, dict):
+        raise RuntimeError(f"Missing session_meta after update: {path}")
+    if expected_thread_id and payload.get("id") != expected_thread_id:
+        raise RuntimeError(f"Thread id changed while updating {path}")
+    if payload.get("model_provider") != provider:
+        raise RuntimeError(f"Provider validation failed for {path}")
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str) and cwd.startswith(EXTENDED_PREFIX):
+        raise RuntimeError(f"Extended cwd validation failed for {path}")
+
+
+def rewrite_jsonl_file(
+    path: pathlib.Path, provider: str, expected_thread_id: str | None = None
+) -> tuple[bool, str]:
+    record = read_first_json_record(path)
+    if not record:
+        return False, "none"
+    item = record["item"]
+    payload = item.get("payload") if isinstance(item, dict) else None
+    if item.get("type") != "session_meta" or not isinstance(payload, dict):
+        return False, "none"
+    if expected_thread_id and payload.get("id") != expected_thread_id:
+        raise RuntimeError(f"Refusing to update unexpected thread id in {path}")
     changed = False
-    lines_changed = 0
-    for raw in raw_lines:
-        if raw.endswith("\r\n"):
-            body, newline = raw[:-2], "\r\n"
-        elif raw.endswith("\n"):
-            body, newline = raw[:-1], "\n"
-        else:
-            body, newline = raw, ""
-        if not body.strip():
-            out.append(raw)
-            continue
+    if payload.get("model_provider") != provider:
+        payload["model_provider"] = provider
+        changed = True
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str) and cwd.startswith(EXTENDED_PREFIX):
+        payload["cwd"] = cwd[len(EXTENDED_PREFIX) :]
+        changed = True
+    if not changed:
+        return False, "none"
+    new_raw = (
+        json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        + record["newline"]
+    )
+    if len(new_raw) == len(record["raw"]):
         try:
-            item = json.loads(body)
+            with path.open("r+b") as handle:
+                handle.seek(record["offset"])
+                handle.write(new_raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            verify_session_meta(path, provider, expected_thread_id)
         except Exception:
-            out.append(raw)
-            continue
-        payload = item.get("payload") if isinstance(item, dict) else None
-        if item.get("type") == "session_meta" and isinstance(payload, dict):
-            local_changed = False
-            if isinstance(payload.get("model_provider"), str) and payload["model_provider"] != provider:
-                payload["model_provider"] = provider
-                local_changed = True
-            if isinstance(payload.get("cwd"), str) and payload["cwd"].startswith(EXTENDED_PREFIX):
-                payload["cwd"] = payload["cwd"][len(EXTENDED_PREFIX) :]
-                local_changed = True
-            if local_changed:
-                changed = True
-                lines_changed += 1
-                out.append(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + newline)
-                continue
-        out.append(raw)
-    if changed:
-        tmp = path.with_name(path.name + ".codex-history-recovery-tmp")
-        tmp.write_text("".join(out), encoding="utf-8", newline="")
+            with path.open("r+b") as handle:
+                handle.seek(record["offset"])
+                handle.write(record["raw"])
+                handle.flush()
+                os.fsync(handle.fileno())
+            raise
+        return True, "in_place"
+
+    tmp = path.with_name(
+        f"{path.name}.codex-history-recovery-{os.getpid()}-{dt.datetime.now().strftime('%f')}.tmp"
+    )
+    try:
+        with path.open("rb") as source, tmp.open("xb") as destination:
+            prefix = source.read(record["offset"])
+            if len(prefix) != record["offset"]:
+                raise RuntimeError(f"File changed while preparing update: {path}")
+            destination.write(prefix)
+            destination.write(new_raw)
+            source.seek(record["offset"] + len(record["raw"]))
+            shutil.copyfileobj(source, destination, length=1024 * 1024)
+            destination.flush()
+            os.fsync(destination.fileno())
+        shutil.copystat(path, tmp)
+        verify_session_meta(tmp, provider, expected_thread_id)
         os.replace(tmp, path)
-    return changed, lines_changed
+        verify_session_meta(path, provider, expected_thread_id)
+        return True, "stream_replace"
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
-def apply_jsonl(codex_home: pathlib.Path, provider: str) -> dict[str, Any]:
-    files_seen = files_changed = lines_changed = 0
+def apply_jsonl_changes(changes: list[dict[str, Any]], provider: str) -> dict[str, Any]:
+    files_changed = 0
+    modes: Counter[str] = Counter()
     errors: list[dict[str, str]] = []
-    for dirname in ("sessions", "archived_sessions"):
-        root = codex_home / dirname
-        if not root.exists():
+    for change in changes:
+        path = change["path"]
+        try:
+            changed, mode = rewrite_jsonl_file(path, provider, change.get("thread_id"))
+        except Exception as exc:
+            errors.append({"path": str(path), "error": repr(exc)})
             continue
-        for path in root.rglob("*.jsonl"):
-            files_seen += 1
-            try:
-                changed, n = rewrite_jsonl_file(path, provider)
-            except Exception as exc:
-                errors.append({"path": str(path), "error": repr(exc)})
-                continue
-            if changed:
-                files_changed += 1
-                lines_changed += n
+        if changed:
+            files_changed += 1
+            modes[mode] += 1
     return {
-        "files_seen": files_seen,
+        "files_planned": len(changes),
         "files_changed": files_changed,
-        "lines_changed": lines_changed,
+        "write_modes": dict(modes),
         "errors": errors,
     }
 
 
 def print_json(data: Any) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def public_jsonl_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "files_seen": plan["files_seen"],
+        "files_to_change": plan["files_to_change"],
+        "changes": [
+            {**change, "path": str(change["path"])} for change in plan["changes"]
+        ],
+        "errors": plan["errors"],
+    }
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -612,49 +918,177 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_apply(args: argparse.Namespace) -> int:
     codex_home = pathlib.Path(args.codex_home).expanduser()
     provider = args.provider or load_current_provider(codex_home)
+    backup_root = (
+        pathlib.Path(args.backup_root).expanduser()
+        if args.backup_root
+        else default_backup_root(codex_home)
+    )
+    db_plan = [
+        db_change_counts(path, provider, args.thread_id)
+        for path in candidate_state_dbs(codex_home)
+    ]
+    jsonl_plan = collect_jsonl_changes(codex_home, provider, args.thread_id)
+    preflight = {
+        "thread_id": args.thread_id,
+        "db": db_plan,
+        "jsonl": public_jsonl_plan(jsonl_plan),
+    }
+    if (
+        args.thread_id
+        and not any(item["thread_rows"] for item in db_plan)
+        and jsonl_plan["files_seen"] == 0
+    ):
+        print_json(
+            {
+                "error": f"Thread id was not found: {args.thread_id}",
+                "preflight": preflight,
+                "backup_created": False,
+            }
+        )
+        return 4
+    if jsonl_plan["errors"]:
+        print_json(
+            {
+                "error": "Preflight could not safely inspect every target JSONL file.",
+                "preflight": preflight,
+                "backup_created": False,
+            }
+        )
+        return 3
+    total_db_changes = sum(item["provider_rows"] + item["cwd_rows"] for item in db_plan)
+    if total_db_changes == 0 and not jsonl_plan["changes"]:
+        print_json(
+            {
+                "result": "no_changes",
+                "target_provider": provider,
+                "preflight": preflight,
+                "backup_created": False,
+            }
+        )
+        return 0
+
     running = running_codex_processes()
     if running and not args.allow_running:
         print_json(
             {
                 "error": "Codex processes are running. Fully quit Codex Desktop before apply, or rerun with --allow-running.",
                 "running_codex_processes": running,
+                "preflight": preflight,
+                "backup_created": False,
             }
         )
         return 2
-    backup = make_backup(codex_home)
-    db_reports = [apply_db(path, provider) for path in candidate_state_dbs(codex_home)]
-    jsonl_report = apply_jsonl(codex_home, provider)
+
+    backup_mode = "full"
+    increment: pathlib.Path | None = None
+    if args.thread_id:
+        baseline = latest_complete_backup(codex_home, backup_root)
+        if baseline:
+            backup = baseline
+            increment, backup_integrity = make_incremental_backup(
+                codex_home,
+                baseline,
+                args.thread_id,
+                [change["path"] for change in jsonl_plan["changes"]],
+            )
+            backup_mode = "incremental"
+        else:
+            backup = make_backup(codex_home, backup_root)
+            backup_integrity = backup_source_coverage(backup, codex_home)
+            backup_mode = "full_baseline"
+    else:
+        backup = make_backup(codex_home, backup_root)
+        backup_integrity = backup_source_coverage(backup, codex_home)
+
+    if not backup_integrity.get("complete"):
+        print_json(
+            {
+                "error": "Backup did not pass pre-write validation; no source data was changed.",
+                "backup_dir": str(backup),
+                "backup_increment": str(increment) if increment else None,
+                "backup_integrity": backup_integrity,
+            }
+        )
+        return 3
+
+    db_reports = [
+        apply_db(path, provider, args.thread_id) for path in candidate_state_dbs(codex_home)
+    ]
+    jsonl_report = apply_jsonl_changes(jsonl_plan["changes"], provider)
+    remaining_db = [
+        db_change_counts(path, provider, args.thread_id)
+        for path in candidate_state_dbs(codex_home)
+    ]
+    remaining_jsonl = collect_jsonl_changes(codex_home, provider, args.thread_id)
+    validation = {
+        "ok": (
+            not jsonl_report["errors"]
+            and not remaining_jsonl["errors"]
+            and remaining_jsonl["files_to_change"] == 0
+            and all(
+                item["provider_rows"] == 0 and item["cwd_rows"] == 0
+                for item in remaining_db
+            )
+        ),
+        "remaining_db": remaining_db,
+        "remaining_jsonl": public_jsonl_plan(remaining_jsonl),
+    }
     roots = read_global_roots(codex_home)
     final_status = [
         summarize_db(path, roots, args.thread_id) for path in candidate_state_dbs(codex_home)
     ]
-    new_backup_integrity = backup_source_coverage(backup, codex_home)
     report = {
         "backup_dir": str(backup),
+        "backup_increment": str(increment) if increment else None,
+        "backup_mode": backup_mode,
+        "backup_root": str(backup_root),
         "target_provider": provider,
+        "preflight": preflight,
         "running_codex_processes": running,
         "db_apply": db_reports,
         "jsonl_apply": jsonl_report,
         "final_state_dbs": final_status,
-        "new_backup_integrity": new_backup_integrity,
+        "backup_integrity": backup_integrity,
+        "validation": validation,
     }
-    (backup / "apply-report.json").write_text(
+    report_path = (increment or backup) / "apply-report.json"
+    report_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    if new_backup_integrity["complete"]:
-        report["backup_retention"] = prune_history_backups(codex_home, args.keep_backups)
+    if validation["ok"] and backup_mode != "incremental":
+        report["backup_retention"] = prune_history_backups(
+            codex_home, args.keep_backups, backup_root
+        )
+    elif validation["ok"]:
+        report["backup_retention"] = {
+            "backup_root": str(backup_root),
+            "keep_backups": args.keep_backups,
+            "kept": [str(backup)],
+            "deleted": [],
+            "skipped": "targeted recovery reused the latest complete baseline",
+        }
     else:
         report["backup_retention"] = {
-            "skipped": "new backup did not pass basic source coverage; refused to prune old backups"
+            "skipped": "post-write validation failed; refused to prune any backups"
         }
     if backup.exists():
-        (backup / "apply-report.json").write_text(
+        stats = backup_tree_stats(backup)
+        report["backup_summary"] = {
+            "path": str(backup),
+            "total_bytes": stats["bytes"],
+            "total_gb": round(stats["bytes"] / (1024**3), 2),
+            "files": stats["files"],
+            "jsonl": stats["jsonl"],
+            "sqlite": stats["sqlite"],
+            "latest_time": stats["latest_time"],
+        }
+        report_path.write_text(
             json.dumps(report, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
     print_json(report)
-    return 0
+    return 0 if validation["ok"] else 3
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -669,7 +1103,10 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--thread-id", help="Specific thread id to inspect.")
     status.set_defaults(func=cmd_status)
     apply = sub.add_parser("apply", help="Backup and repair provider/cwd metadata.")
-    apply.add_argument("--thread-id", help="Specific thread id to include in final diagnostics.")
+    apply.add_argument(
+        "--thread-id",
+        help="Repair only this thread and append a small pre-write snapshot to the latest complete backup.",
+    )
     apply.add_argument("--provider", help="Override target provider. Defaults to config.toml.")
     apply.add_argument(
         "--allow-running",
@@ -681,6 +1118,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Keep this many latest complete codex-history-recovery backups after a successful apply.",
+    )
+    apply.add_argument(
+        "--backup-root",
+        help="Backup root. Defaults to CODEX_HISTORY_BACKUP_DIR or D:\\CodexBackups\\codex-history-recovery on Windows.",
     )
     apply.set_defaults(func=cmd_apply)
     return parser
